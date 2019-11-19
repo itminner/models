@@ -403,6 +403,34 @@ def print_info(pass_id, batch_id, print_step, metrics, time_info, info_mode):
     else:
         raise Exception("Illegal info_mode")
 
+def best_strategy_with_compiled_program(args, compiled_program, loss, exe):
+    """make a program which wrapped by a compiled program
+    """
+
+    if os.getenv('FLAGS_use_ngraph'):
+        return compiled_program
+    else:
+        build_strategy = fluid.compiler.BuildStrategy()
+        #Feature will be supported in Fluid v1.6
+        #build_strategy.enable_inplace = True
+
+        exec_strategy = fluid.ExecutionStrategy()
+        exec_strategy.num_threads = fluid.core.get_cuda_device_count()
+        exec_strategy.num_iteration_per_drop_scope = 10
+
+        num_trainers = int(os.environ.get('PADDLE_TRAINERS_NUM', 1))
+        if num_trainers > 1 and args.use_gpu:
+            dist_utils.prepare_for_multi_process(exe, build_strategy, compiled_program)
+            # NOTE: the process is fast when num_threads is 1
+            # for multi-process training.
+            exec_strategy.num_threads = 1
+
+        compiled_program = compiled_program.with_data_parallel(
+            loss_name=loss.name,
+            build_strategy=build_strategy,
+            exec_strategy=exec_strategy)
+
+        return compiled_program
 
 def best_strategy_compiled(args, program, loss, exe):
     """make a program which wrapped by a compiled program
