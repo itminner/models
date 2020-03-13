@@ -21,6 +21,12 @@ def train(args):
     :param args: hyperparams of model
     :return:
     """
+    # ce
+    if args.enable_ce:
+        SEED = 102
+        fluid.default_main_program().random_seed = SEED
+        fluid.default_startup_program().random_seed = SEED
+
     cat_feat_dims_dict = OrderedDict()
     for line in open(args.cat_feat_num):
         spls = line.strip().split()
@@ -74,13 +80,10 @@ def train(args):
             debug=False,
             print_period=args.print_steps)
         model_dir = os.path.join(args.model_output_dir,
-                                 'epoch_' + str(epoch_id + 1))
+                                 'epoch_' + str(epoch_id + 1), "checkpoint")
         sys.stderr.write('epoch%d is finished and takes %f s\n' % (
             (epoch_id + 1), time.time() - start))
-        fluid.io.save_persistables(
-            executor=exe,
-            dirname=model_dir,
-            main_program=fluid.default_main_program())
+        fluid.save(fluid.default_main_program(), model_dir)
 
 
 if __name__ == '__main__':

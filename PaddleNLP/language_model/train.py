@@ -25,6 +25,7 @@ import contextlib
 from distutils.dir_util import mkpath
 import paddle
 import paddle.fluid as fluid
+from paddle.fluid import profiler
 import paddle.fluid.framework as framework
 import paddle.fluid.profiler as profiler
 from paddle.fluid.executor import Executor
@@ -35,7 +36,7 @@ import sys
 if sys.version[0] == '2':
     reload(sys)
     sys.setdefaultencoding("utf-8")
-sys.path.append('../')
+sys.path.append('../shared_modules/')
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
@@ -50,16 +51,16 @@ SEED = 123
 
 
 @contextlib.contextmanager
-def profile_context(profile=True):
+def profile_context(profile=True, profiler_path='/tmp/paddingrnn.profile'):
     if profile:
-        with profiler.profiler('All', 'total', '/tmp/paddingrnn.profile'):
+        with profiler.profiler('All', 'total', profiler_path):
             yield
     else:
         yield
 
 
 def get_current_model_para(train_prog, train_exe):
-    param_list = train_prog.block(0).all_parameters()
+    param_list = train_prog.all_parameters()
     param_name_list = [p.name for p in param_list]
 
     vals = {}
@@ -72,7 +73,7 @@ def get_current_model_para(train_prog, train_exe):
 
 def save_para_npz(train_prog, train_exe):
     print("begin to save model to model_base")
-    param_list = train_prog.block(0).all_parameters()
+    param_list = train_prog.all_parameters()
     param_name_list = [p.name for p in param_list]
 
     vals = {}
@@ -124,7 +125,6 @@ def main():
             res_vars = lm_model.lm_model(
                 config.hidden_size,
                 config.vocab_size,
-                config.batch_size,
                 num_layers=config.num_layers,
                 num_steps=config.num_steps,
                 init_scale=config.init_scale,
@@ -159,7 +159,6 @@ def main():
             lm_model.lm_model(
                 config.hidden_size,
                 config.vocab_size,
-                config.batch_size,
                 num_layers=config.num_layers,
                 num_steps=config.num_steps,
                 init_scale=config.init_scale,
@@ -192,6 +191,12 @@ def main():
 
     build_strategy = fluid.BuildStrategy()
     build_strategy.fuse_all_optimizer_ops = True
+    try:
+        fluid.require_version(min_version='1.7.0')
+        build_strategy.enable_auto_fusion = args.enable_auto_fusion
+    except Exception as e:
+        logger.info("PaddlePaddle version 1.7.0 or higher is "
+                    "required when you want to enable fusion_group.")
 
     if args.parallel:
         train_program = fluid.compiler.CompiledProgram(
@@ -318,6 +323,12 @@ def main():
                 print(
                     "-- Epoch:[%d]; Batch:[%d]; Time: %.5f s; ppl: %.5f, lr: %.5f"
                     % (epoch_id, batch_id, batch_time, ppl[0], lr[0]))
+
+            # profiler tools for benchmark
+            if args.profile and batch_id == log_interval:
+                profiler.reset_profiler()
+            elif args.profile and batch_id == (log_interval + 5):
+                break
         ppl = np.exp(total_loss / iters)
         return ppl
 
@@ -371,6 +382,11 @@ def main():
                         % (epoch_id, batch_id, batch_time, ppl[0], lr[0]))
 
                 batch_id += 1
+                # profiler tools for benchmark
+                if args.profile and batch_id == log_interval:
+                    profiler.reset_profiler()
+                elif args.profile and batch_id == (log_interval + 5):
+                    break
         except fluid.core.EOFException:
             dataloader.reset()
 
@@ -428,34 +444,37 @@ def main():
                 print("ptblm\tlstm_language_model_%s_loss_card%d\t%s" %
                       (args.rnn_model, device_count, train_ppl[0]))
 
-            # NOTE(zjl): sometimes we have not enough data for eval if batch_size is large, i.e., 2100
-            # Just skip to avoid error
-            def is_valid_data(data, batch_size, num_steps):
-                data_len = len(data)
-                batch_len = data_len // batch_size
-                epoch_size = (batch_len - 1) // num_steps
-                return epoch_size >= 1
+            if not args.profile:
+                # NOTE(zjl): sometimes we have not enough data for eval if batch_size is large, i.e., 2100
+                # Just skip to avoid error
+                def is_valid_data(data, batch_size, num_steps):
+                    data_len = len(data)
+                    batch_len = data_len // batch_size
+                    epoch_size = (batch_len - 1) // num_steps
+                    return epoch_size >= 1
 
-            valid_data_valid = is_valid_data(valid_data, config.batch_size,
-                                             config.num_steps)
-            if valid_data_valid:
-                valid_ppl = eval(valid_data)
-                print("Valid ppl: %.5f" % valid_ppl[0])
-            else:
-                print(
-                    'WARNING: length of valid_data is {}, which is not enough for batch_size {} and num_steps {}'.
-                    format(
-                        len(valid_data), config.batch_size, config.num_steps))
+                valid_data_valid = is_valid_data(valid_data, config.batch_size,
+                                                 config.num_steps)
+                if valid_data_valid:
+                    valid_ppl = eval(valid_data)
+                    print("Valid ppl: %.5f" % valid_ppl[0])
+                else:
+                    print(
+                        'WARNING: length of valid_data is {}, which is not enough for batch_size {} and num_steps {}'.
+                        format(
+                            len(valid_data), config.batch_size,
+                            config.num_steps))
 
-            save_model_dir = os.path.join(args.save_model_dir, str(epoch_id))
-            if not os.path.exists(save_model_dir):
-                mkpath(save_model_dir)
-            save_model_dir = os.path.join(save_model_dir, 'params')
+                save_model_dir = os.path.join(args.save_model_dir,
+                                              str(epoch_id))
+                if not os.path.exists(save_model_dir):
+                    mkpath(save_model_dir)
+                save_model_dir = os.path.join(save_model_dir, 'params')
 
-            fluid.save(main_program, save_model_dir)
-            print("Saved model to: %s.\n" % save_model_dir)
+                fluid.save(main_program, save_model_dir)
+                print("Saved model to: %s.\n" % save_model_dir)
 
-    with profile_context(args.profile):
+    with profile_context(args.profile, args.profiler_path):
         train()
 
     test_ppl = eval(test_data)
